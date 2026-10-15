@@ -1,7 +1,81 @@
-- name: Override config từ input
+name: Jio Gemini Scanner
+
+on:
+  workflow_dispatch:
+    inputs:
+      scan_limit:
+        description: "Số message gần nhất mỗi device"
+        required: false
+        default: "100"
+        type: string
+      otp_timeout:
+        description: "Giây chờ OTP (khuyến nghị 90+)"
+        required: false
+        default: "90"
+        type: string
+  # schedule:
+  #   - cron: "0 */6 * * *"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install tzdata (cho zoneinfo Asia/Kathmandu)
+        run: sudo apt-get update && sudo apt-get install -y tzdata
+
+      - name: Override config từ input
         if: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
           sed -i "s/^MESSAGE_SCAN_LIMIT = .*/MESSAGE_SCAN_LIMIT = ${{ inputs.scan_limit }}/" jio_gemini_share.py
           sed -i "s/^OTP_TIMEOUT = .*/OTP_TIMEOUT = ${{ inputs.otp_timeout }}/" jio_gemini_share.py
           echo "--- Config sau override ---"
-          grep -E "^(MESSAGE_SCAN_LIMIT|OTP_TIMEOUT)" jio_gemini_share.py
+          grep -E "^(MESSAGE_SCAN_LIMIT|OTP_TIMEOUT|TEST_MODE|TEST_LIMIT)" jio_gemini_share.py
+
+      - name: Run scanner
+        run: python jio_gemini_share.py
+        continue-on-error: true
+
+      - name: List output files (debug)
+        if: always()
+        run: |
+          echo "--- Files in workspace ---"
+          ls -la
+          echo "--- Checking specific files ---"
+          ls -la gemini_results.csv 2>/dev/null || echo "gemini_results.csv NOT FOUND"
+          ls -la gemini_activation_links.txt 2>/dev/null || echo "gemini_activation_links.txt NOT FOUND"
+
+      - name: Upload links file
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: activation-links
+          path: gemini_activation_links.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload results CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-csv
+          path: gemini_results.csv
+          if-no-files-found: warn
+          retention-days: 30
