@@ -1,0 +1,70 @@
+name: Jio Gemini Scanner
+
+on:
+  workflow_dispatch:
+    inputs:
+      scan_limit:
+        description: "Số message gần nhất mỗi device"
+        required: false
+        default: "100"
+        type: string
+      otp_timeout:
+        description: "Giây chờ OTP"
+        required: false
+        default: "15"
+        type: string
+  # Nếu muốn chạy định kỳ, bỏ comment:
+  # schedule:
+  #   - cron: "0 */6 * * *"   # 6 tiếng 1 lần
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Install tzdata (cho zoneinfo Asia/Kathmandu)
+        run: sudo apt-get update && sudo apt-get install -y tzdata
+
+      - name: Override config từ input
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          sed -i "s/^MESSAGE_SCAN_LIMIT = .*/MESSAGE_SCAN_LIMIT = ${{ inputs.scan_limit }}/" jio_gemini_share.py
+          sed -i "s/^OTP_TIMEOUT = .*/OTP_TIMEOUT = ${{ inputs.otp_timeout }}/" jio_gemini_share.py
+          head -40 jio_gemini_share.py | tail -15
+
+      - name: Run scanner
+        run: python jio_gemini_share.py
+        continue-on-error: true
+
+      - name: Upload links file
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: activation-links
+          path: gemini_activation_links.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload results CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-csv
+          path: gemini_results.csv
+          if-no-files-found: warn
+          retention-days: 30
