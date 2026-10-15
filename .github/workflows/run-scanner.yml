@@ -13,9 +13,11 @@ on:
         required: false
         default: "15"
         type: string
-  # Nếu muốn chạy định kỳ, bỏ comment:
   # schedule:
-  #   - cron: "0 */6 * * *"   # 6 tiếng 1 lần
+  #   - cron: "0 */6 * * *"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   scan:
@@ -27,17 +29,16 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install -r requirements.txt
 
-      - name: Install tzdata (cho zoneinfo Asia/Kathmandu)
+      - name: Install tzdata
         run: sudo apt-get update && sudo apt-get install -y tzdata
 
       - name: Override config từ input
@@ -45,11 +46,21 @@ jobs:
         run: |
           sed -i "s/^MESSAGE_SCAN_LIMIT = .*/MESSAGE_SCAN_LIMIT = ${{ inputs.scan_limit }}/" jio_gemini_share.py
           sed -i "s/^OTP_TIMEOUT = .*/OTP_TIMEOUT = ${{ inputs.otp_timeout }}/" jio_gemini_share.py
-          head -40 jio_gemini_share.py | tail -15
+          echo "--- Config sau override ---"
+          grep -E "^(MESSAGE_SCAN_LIMIT|OTP_TIMEOUT)" jio_gemini_share.py
 
       - name: Run scanner
         run: python jio_gemini_share.py
         continue-on-error: true
+
+      - name: List output files (debug)
+        if: always()
+        run: |
+          echo "--- Files in workspace ---"
+          ls -la
+          echo "--- Checking specific files ---"
+          ls -la gemini_results.csv 2>/dev/null || echo "gemini_results.csv NOT FOUND"
+          ls -la gemini_activation_links.txt 2>/dev/null || echo "gemini_activation_links.txt NOT FOUND"
 
       - name: Upload links file
         if: always()
